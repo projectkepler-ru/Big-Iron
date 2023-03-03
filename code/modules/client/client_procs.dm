@@ -427,7 +427,7 @@ GLOBAL_LIST_INIT(blacklisted_builds, list(
 		message_admins("New user: [key_name_admin(src)] just connected with an age of [cached_player_age] day[(player_age==1?"":"s")]")
 	if(CONFIG_GET(flag/use_account_age_for_jobs) && account_age >= 0)
 		player_age = account_age
-	
+
 /*
 	if(account_age > -1 && account_age < 15)
 		var/datum/db_query/query_add_ban = SSdbcore.NewQuery(
@@ -1100,3 +1100,126 @@ GLOBAL_LIST_INIT(blacklisted_builds, list(
 		var/datum/verbs/menu/menuitem = GLOB.menulist[thing]
 		if (menuitem)
 			menuitem.Load_checked(src)
+
+// taken from here https://github.com/ParadiseSS13/Paradise/blob/master/code/modules/client/client_procs.dm#L1124
+/**
+  * Retrieves the BYOND accounts data from the BYOND servers
+  *
+  * Makes a web request to byond.com to retrieve the details for the BYOND account associated with the clients ckey.
+  * Returns the data in a parsed, associative list
+  */
+/client/proc/retrieve_byondacc_data()
+	// Do not refactor this to use SShttp, because that requires the subsystem to be firing for requests to be made, and this will be triggered before the MC has finished loading
+	var/list/http[] = HTTPGet("http://www.byond.com/members/[ckey]?format=text")
+	if(http)
+		var/status = text2num(http["STATUS"])
+
+		if(status == 200)
+			// This is wrapped in try/catch because lummox could change the format on any day without informing anyone
+			try
+				var/list/lines = splittext(http["CONTENT"], "\n")
+				var/list/initial_data = list()
+				var/current_index = ""
+
+				for(var/L in lines)
+					if(L == "")
+						continue
+
+					if(!findtext(L, "\t"))
+						current_index = L
+						initial_data[current_index] = list()
+						continue
+
+					initial_data[current_index] += replacetext(replacetext(L, "\t", ""), "\"", "")
+
+				var/list/parsed_data = list()
+
+				for(var/key in initial_data)
+					var/inner_list = list()
+					for(var/entry in initial_data[key])
+						var/list/split = splittext(entry, " = ")
+						var/inner_key = split[1]
+						var/inner_value = split[2]
+						inner_list[inner_key] = inner_value
+
+					parsed_data[key] = inner_list
+
+				// Main return is here
+				return parsed_data
+
+			catch
+				log_debug("Error parsing byond.com data for [ckey]. Please inform maintainers.")
+				return null
+
+		else
+			log_debug("Error retrieving data from byond.com for [ckey]. Invalid status code (Expected: 200 | Got: [status]).")
+			return null
+
+	else
+		log_debug("Failed to retrieve data from byond.com for [ckey]. Connection failed.")
+		return null
+
+
+/**
+  * Sets the clients BYOND date up properly
+  *
+  * If the client does not have a saved BYOND account creation date, retrieve it from the website
+  * If they do have a saved date, use that from the DB, because this value will never change
+  * Arguments:
+  * * notify - Do we notify admins of this new accounts date
+  */
+/client/proc/get_byond_account_date(notify = FALSE)
+	// First we see if the client has a saved date in the DB
+	var/datum/db_query/query_date = SSdbcore.NewQuery("SELECT byond_date, DATEDIFF(Now(), byond_date) FROM player WHERE ckey=:ckey", list(
+		"ckey" = ckey
+	))
+
+	if(!query_date.warn_execute())
+		qdel(query_date)
+		return
+
+	while(query_date.NextRow())
+		byondacc_date = query_date.item[1]
+		byondacc_age = max(text2num(query_date.item[2]), 0) // Ensure account isnt negative days old
+
+	qdel(query_date)
+
+	// They have a date already, lets bail
+	if(byondacc_date)
+		return
+
+	// They dont have a date, lets grab one
+	var/list/byond_data = retrieve_byondacc_data()
+	if(isnull(byond_data) || !(byond_data["general"]["joined"]))
+		log_debug("Failed to retrieve an account creation date for [ckey].")
+		return
+
+	byondacc_date = byond_data["general"]["joined"]
+
+	// Now save it
+	var/datum/db_query/query_update = SSdbcore.NewQuery("UPDATE player SET byond_date=:date WHERE ckey=:ckey", list(
+		"date" = byondacc_date,
+		"ckey" = ckey
+	))
+
+	if(!query_update.warn_execute())
+		qdel(query_update)
+		return
+
+	qdel(query_update)
+
+	// Now retrieve the age again because BYOND doesnt have native methods for this
+	var/datum/db_query/query_age = SSdbcore.NewQuery("SELECT DATEDIFF(Now(), byond_date) FROM player WHERE ckey=:ckey", list(
+		"ckey" = ckey
+	))
+
+	if(!query_age.warn_execute())
+		qdel(query_age)
+		return
+
+	while(query_age.NextRow())
+		byondacc_age = max(text2num(query_age.item[1]), 0) // Ensure account isnt negative days old
+
+	qdel(query_age)
+
+
